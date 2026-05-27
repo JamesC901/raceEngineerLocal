@@ -1,5 +1,5 @@
 TODO:
-* 1. llama some reason doesnt determine 0 as damage sometimes
+* 1. llama some reason doesn determines car damage 0 as damage sometimes
 * 2. Position updates at end of lap, needs to be instant
 * 3. Kokoro TTS model sounds like a robot, look to see if there is another solution/library to use instead
 * 4. Engineer talks too much
