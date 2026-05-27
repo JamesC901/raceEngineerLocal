@@ -510,7 +510,17 @@ class AcSharedMemory:
                 round(float(phys.CarDamage[4]), 3),
             ],
             #Physics - Fuel level
-            "fuel": float(phys.Fuel)
+            "fuel": float(phys.Fuel),
+            # Physics — driving inputs
+            "speed_kmh":           float(phys.SpeedKmh),
+            "engine_rpm":          int(phys.Rpms),
+            "gear":                int(phys.Gear),
+            "gas":                 float(phys.Gas),
+            "brake":               float(phys.Brake),
+            # Physics — active aids (non-zero = active)
+            "is_tc_in_action":        float(phys.TC) > 0.0,
+            "is_abs_in_action":       float(phys.Abs) > 0.0,
+            "is_engine_limiter_on":   bool(phys.PitLimiterOn),
         }
 
 

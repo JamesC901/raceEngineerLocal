@@ -1,16 +1,17 @@
 import argparse
 import queue
 import signal
+import threading
+import time
 import numpy as np
 import whisper
 import requests
 import json
 import os
 from dotenv import load_dotenv
-from game_server import start_game_server, get_game_data, get_handshake_data, get_lap_data
+from game_server import start_game_server, stop_game_server
 from ac_shared_memory import get_shared_memory_data
 from gap_calculator import calculate_gaps
-
 
 try:
     import sounddevice as sd
@@ -18,9 +19,9 @@ except ImportError:
     sd = None
 
 load_dotenv()
-MODEL_NAME = os.getenv("MODEL_NAME")
+MODEL_NAME   = os.getenv("MODEL_NAME")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL")
-OLLAMA_URL = os.getenv("OLLAMA_URL")
+OLLAMA_URL   = os.getenv("OLLAMA_URL")
 _running = True
 
 # Whisper commonly hallucinates these on silence/noise
@@ -30,18 +31,26 @@ HALLUCINATIONS = {
     "subtitles by", "transcribed by",
 }
 
+# ---------------------------------------------------------------------------
+# Signal handling
+# ---------------------------------------------------------------------------
 
 def handle_sigint(sig, frame):
     global _running
-    print("\n\nStopping transcription...")
+    print("\n\nStopping...")
     _running = False
 
-def format_lap_time(time):
-    if time > 0:
-        minutes = time // 60000
-        seconds = (time % 60000) / 1000
-        return f" {minutes}:{seconds:06.3f}"
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def format_lap_time(ms: int) -> str:
+    if ms > 0:
+        minutes = ms // 60000
+        seconds = (ms % 60000) / 1000
+        return f"{minutes}:{seconds:06.3f}"
     return "N/A"
+
 
 def normalize_audio(audio: np.ndarray) -> np.ndarray:
     if audio.dtype == np.int16:
@@ -68,191 +77,242 @@ def transcribe_audio_array(audio: np.ndarray, model_name: str = MODEL_NAME, mode
     result = model.transcribe(audio, language="en", verbose=False, no_speech_threshold=0.6, fp16=False)
     return result["text"].strip()
 
+# ---------------------------------------------------------------------------
+# Telemetry formatting — 100 % from shared memory
+# ---------------------------------------------------------------------------
 
-def format_telemetry(game_data: dict) -> str:
-    """Format telemetry data into readable text for the race engineer."""
-    if not game_data:
-        return ""
-    
-    telemetry_text = "\n[Current Car Telemetry]:\n"
-    telemetry_text += f"  Speed: {game_data.get('speed_kmh', 0):.1f} km/h | RPM: {game_data.get('engine_rpm', 0):.0f}\n"
-    telemetry_text += f"  Gear: {game_data.get('gear', 0)} | Throttle: {game_data.get('gas', 0)*100:.1f}% | Brake: {game_data.get('brake', 0)*100:.1f}%\n"
-    
-    if game_data.get('is_tc_in_action'):
-        telemetry_text += f"  TC IS ACTIVE\n"
-    if game_data.get('is_abs_in_action'):
-        telemetry_text += f"  ABS IS ACTIVE\n"
-    if game_data.get('is_engine_limiter_on'):
-        telemetry_text += f"  ENGINE LIMITER ON\n"
-    
-    # lap_time = game_data.get('lap_time', 0)
-    # if lap_time > 0:
-    #     minutes = lap_time // 60000
-    #     seconds = (lap_time % 60000) / 1000
-    #     telemetry_text += f"  Current Lap: {minutes}:{seconds:06.3f}\n"
+def format_telemetry(sm: dict) -> str:
+    """
+    Build a human-readable telemetry block from a shared memory snapshot.
+    `sm` is the dict returned by get_shared_memory_data().
+    """
+    if not sm:
+        return "[No telemetry — AC not connected]"
 
-    lap_time = game_data.get('lap_time', 0)
-    telemetry_text += f"  Current Lap Time: " + format_lap_time(lap_time)
+    lines = ["[Current Telemetry]"]
 
-    best_lap = game_data.get('best_lap', 0)
-    telemetry_text += f"  Best Lap Time: " + format_lap_time(best_lap)
+    # --- Session / static ---
+    lines.append(f"  Track        : {sm.get('track', 'N/A')} "
+                 f"({sm.get('tire_compound', 'N/A')} tyres)")
+    lines.append(f"  Car          : {sm.get('car_model', 'N/A')}")
+    lines.append(f"  Cars on grid : {sm.get('num_cars', 'N/A')}")
 
-    last_lap = game_data.get('last_lap', 0)
-    telemetry_text += f"  Last Lap Time: " + format_lap_time(last_lap)
+    session_map = {-1: "Unknown", 0: "Practice", 1: "Qualifying",
+                   2: "Race", 3: "Hotlap", 4: "Time Attack",
+                   5: "Drift", 6: "Drag"}
+    session_label = session_map.get(sm.get('session_type', -1), "Unknown")
+    lines.append(f"  Session      : {session_label}")
 
-    
-    telemetry_text += f"  Lap Count: {game_data.get('lap_count', 0)}\n"
-    
-    
-    #Grab shared memory data
-    sm=get_shared_memory_data()
-    print("Shared memory: ", sm)
-    
-    #Track
-    telemetry_text += f"  Race Track: {sm.get('track', 'None')}\n"
-    #Car Model
-    telemetry_text += f"  Car Model: {sm.get('car_model', 'None')}\n"
-    #Number of Cars
-    telemetry_text += f"  Number of Cars: {sm.get('num_cars', 'None')}\n"
-    #Tyre Compound
-    telemetry_text += f"  Current Tyre Compound: {sm.get('tire_compound', 'None')}\n"
-    #Fuel level:
-    telemetry_text += f"  Fuel level: {sm.get('fuel', 'None')}\n"
-    #Flag Data
-    telemetry_text += f"  Flag: {sm.get('flag', 'None')}\n"
-    #Position
-    telemetry_text += f"  Race Position: {sm.get('position', 'None')}\n"
-    #Pit lane
-    telemetry_text +=  f"  Is Driver in Pit Lane?: {sm.get('is_in_pit_lane', 'No')}\n"
+    time_left = sm.get('session_time_left', 0)
+    if time_left > 0:
+        m, s = divmod(int(time_left), 60)
+        lines.append(f"  Time left    : {m}:{s:02d}")
 
+    # --- Driving ---
+    lines.append(f"  Speed        : {sm.get('speed_kmh', 0):.1f} km/h  |  "
+                 f"RPM: {sm.get('engine_rpm', 0):.0f}  |  "
+                 f"Gear: {sm.get('gear', 0)}")
+    lines.append(f"  Throttle     : {sm.get('gas', 0)*100:.1f}%  |  "
+                 f"Brake: {sm.get('brake', 0)*100:.1f}%  |  "
+                 f"Fuel: {sm.get('fuel', 0):.2f} L")
 
-    # Tyre wear — FL, FR, RL, RR
+    # Active aids
+    aids = []
+    if sm.get('is_tc_in_action'):
+        aids.append("TC")
+    if sm.get('is_abs_in_action'):
+        aids.append("ABS")
+    if sm.get('is_engine_limiter_on'):
+        aids.append("PIT-LIMITER")
+    if aids:
+        lines.append(f"  Active aids  : {', '.join(aids)}")
+
+    # --- Timing ---
+    lines.append(f"  Current lap (Incomplete Lap, still in progress) : {format_lap_time(sm.get('current_lap_ms', 0))}")
+    lines.append(f"  Last lap     : {format_lap_time(sm.get('last_lap_ms', 0))}")
+    lines.append(f"  Best lap     : {format_lap_time(sm.get('best_lap_ms', 0))}")
+    lines.append(f"  Laps done    : {sm.get('completed_laps', 0)}")
+    lines.append(f"  Position     : P{sm.get('position', '?')}")
+    lines.append(f"  Flag         : {sm.get('flag', 'none').upper()}")
+    lines.append(f"  In pit lane  : {sm.get('is_in_pit_lane', False)}")
+
+    # --- Tyres ---
     tyre_wear = sm.get('tyre_wear', [0, 0, 0, 0])
-    telemetry_text += (
-        f"  Tyre Wear (FL/FR/RL/RR): "
+    lines.append(
+        f"  Tyre wear (FL/FR/RL/RR): "
         f"{tyre_wear[0]:.3f} / {tyre_wear[1]:.3f} / "
-        f"{tyre_wear[2]:.3f} / {tyre_wear[3]:.3f}\n"
+        f"{tyre_wear[2]:.3f} / {tyre_wear[3]:.3f}"
     )
-
-    # Tyre temps — FL, FR, RL, RR
-    tyre_core_temp = sm.get('tyre_core_temp', [0, 0, 0, 0])
-    telemetry_text += (
-        f"  Tyre Temps (FL/FR/RL/RR): "
-        f"{tyre_core_temp[0]:.3f} / {tyre_core_temp[1]:.3f} / "
-        f"{tyre_core_temp[2]:.3f} / {tyre_core_temp[3]:.3f}\n"
+    tyre_temp = sm.get('tyre_core_temp', [0, 0, 0, 0])
+    lines.append(
+        f"  Tyre temp °C  (FL/FR/RL/RR): "
+        f"{tyre_temp[0]:.1f} / {tyre_temp[1]:.1f} / "
+        f"{tyre_temp[2]:.1f} / {tyre_temp[3]:.1f}"
     )
-
-    # Tyre Dirtyness — FL, FR, RL, RR
     tyre_dirty = sm.get('tyre_dirty', [0, 0, 0, 0])
-    telemetry_text += (
-        f"  Tyre Dirtiness (FL/FR/RL/RR): "
+    lines.append(
+        f"  Tyre dirt     (FL/FR/RL/RR): "
         f"{tyre_dirty[0]:.3f} / {tyre_dirty[1]:.3f} / "
-        f"{tyre_dirty[2]:.3f} / {tyre_dirty[3]:.3f}\n"
+        f"{tyre_dirty[2]:.3f} / {tyre_dirty[3]:.3f}"
     )
 
-    # Car damage — front, rear, left, right, centre
+    # --- Damage ---
     dmg = sm.get('car_damage', [0, 0, 0, 0, 0])
-    telemetry_text += (
-        f"  Car Damage (Front/Rear/Left/Right/Centre): "
+    lines.append(
+        f"  Damage (F/R/L/R/C): "
         f"{dmg[0]:.3f} / {dmg[1]:.3f} / {dmg[2]:.3f} / "
-        f"{dmg[3]:.3f} / {dmg[4]:.3f}\n"
+        f"{dmg[3]:.3f} / {dmg[4]:.3f}"
     )
 
-    #Gaps
+    # --- Gaps (from acgaps file writer) ---
     gaps = calculate_gaps()
-    telemetry_text +=  f"  Gap (seconds) between the player car and the car in front of it: {gaps.get('gap_ahead_s', 'N/A')}\n"
-    telemetry_text +=  f"  Gap (seconds) between the player car and the car behind of it: {gaps.get('gap_behind_s', 'N/A')}\n"
-    telemetry_text +=  f"  Gap (seconds) between the player car and the car leading the race: {gaps.get('gap_to_leader_s', 'N/A')}\n"
+    def _fmt_gap(val):
+        return f"{val:.2f}s" if val is not None else "N/A"
+    lines.append(f"  Gap to car ahead  : {_fmt_gap(gaps.get('gap_ahead_s'))}")
+    lines.append(f"  Gap to car behind : {_fmt_gap(gaps.get('gap_behind_s'))}")
+    lines.append(f"  Gap to leader     : {_fmt_gap(gaps.get('gap_to_leader_s'))}")
 
+    return "\n".join(lines)
 
+# ---------------------------------------------------------------------------
+# Ollama interface
+# ---------------------------------------------------------------------------
 
-    return telemetry_text
-def format_handshake_data(handshake_data: dict) -> str:
-    if not handshake_data:
-        return ""
-
-    text = "\n[Session Info]:\n"
-    text += f"  Driver: {handshake_data.get('driver_name', 'Unknown')}\n"
-    text += f"  Car: {handshake_data.get('car_name', 'Unknown')}\n"
-    text += f"  Track: {handshake_data.get('track_name', 'Unknown')}\n"
-
-    track_config = handshake_data.get('track_config')
-    if track_config:
-        text += f"  Track Config: {track_config}\n"
-
-    text += f"  Session ID: {handshake_data.get('identifier', 0)}\n"
-    text += f"  Protocol Version: {handshake_data.get('version', 0)}\n"
-
-    return text
-
-
-def format_lap_data(lap_data: dict) -> str:
-    if not lap_data:
-        return ""
-
-    text = "\n[Last Lap Info]:\n"
-    text += f"  Driver: {lap_data.get('driver_name', 'Unknown')}\n"
-    text += f"  Car: {lap_data.get('car_name', 'Unknown')}\n"
-    text += f"  Lap Number: {lap_data.get('lap', 0)}\n"
-
-    lap_time = lap_data.get('time', 0)
-    if lap_time > 0:
-        minutes = lap_time // 60000
-        seconds = (lap_time % 60000) / 1000
-        text += f"  Lap Time: {minutes}:{seconds:06.3f}\n"
-
-    return text
-
-def ask_ollama(text: str, conversation_history: list, ollama_model: str = OLLAMA_MODEL) -> str:
-    # Enhance message with game data if available
-    game_data = get_game_data()
-    handshake_data = get_handshake_data()
-    lap_data = get_lap_data()
-    
-    message_content = text
-    if game_data:
-        telemetry_text = format_telemetry(game_data)
-        lap_text = format_lap_data(lap_data)
-
-        if telemetry_text:
-            message_content = text + "\n\n" + telemetry_text + lap_text
-        print(message_content)
-
-    conversation_history.append({"role": "user", "content": message_content})
-    print("Sending request to Ollama...")
-
+def _send_to_ollama(messages: list, stream: bool = True) -> str:
+    """
+    Send a messages list to Ollama and return the full reply string.
+    Prints streamed tokens to stdout as they arrive.
+    """
     response = requests.post(OLLAMA_URL, json={
-        "model": ollama_model,
-        "messages": conversation_history,
-        "stream": True,
-    }, stream=True)
+        "model": OLLAMA_MODEL,
+        "messages": messages,
+        "stream": stream,
+    }, stream=stream)
 
     if response.status_code != 200:
         return f"[Ollama error {response.status_code}]"
 
     full_reply = ""
-    print(f"\nOllama: ", end="", flush=True)
     for line in response.iter_lines():
         if not line:
             continue
         chunk = json.loads(line)
         token = chunk.get("message", {}).get("content", "")
-        print(token, end="", flush=True)
+        if token:
+            print(token, end="", flush=True)
         full_reply += token
         if chunk.get("done"):
             break
 
-    print()
-    conversation_history.append({"role": "assistant", "content": full_reply})
     return full_reply
 
 
+def ask_ollama(user_text: str, conversation_history: list) -> str:
+    """Voice-triggered exchange. Appends telemetry to the user message."""
+    sm = get_shared_memory_data()
+    telemetry_block = format_telemetry(sm)
+    full_message = f"{user_text}\n\n{telemetry_block}"
+
+    conversation_history.append({"role": "user", "content": full_message})
+    print(f"\n[Sending to Ollama]\n{full_message}\n")
+    print("Ollama: ", end="", flush=True)
+
+    reply = _send_to_ollama(conversation_history)
+    print()
+
+    conversation_history.append({"role": "assistant", "content": reply})
+    return reply
+
+# ---------------------------------------------------------------------------
+# Proactive 1-second telemetry loop
+# ---------------------------------------------------------------------------
+
+# System prompt for the proactive monitor — separate from the voice conversation
+_MONITOR_SYSTEM = (
+    "You are an experienced F1 race engineer monitoring live telemetry for a driver "
+    "in Assetto Corsa. Every second you receive a full telemetry snapshot. "
+    "Your job is to call out anything that genuinely warrants driver attention — "
+    "examples: significant tyre wear difference across axles, dangerously high temps, "
+    "car damage detected, flag changes (yellow/blue/black/checkered), pit-lane entry/exit, "
+    "big lap-time delta vs best lap, or fuel running low.\n\n"
+    "Rules:\n"
+    "- If nothing is noteworthy, respond with exactly: SILENT\n"
+    "- Never comment on normal, expected driving data.\n"
+    "- Keep radio calls short, punchy, and realistic (1-2 sentences max).\n"
+    "- Do NOT repeat an observation you already made unless the situation has worsened.\n"
+    "- Do NOT hallucinate or invent data not present in the telemetry."
+)
+
+
+def _telemetry_monitor_loop(conversation_history: list, interval: float = 1.0):
+    """
+    Background thread: every `interval` seconds, pull shared memory, format it,
+    and ask Ollama whether anything is worth reporting. If the reply is not
+    'SILENT', print it so the driver can hear/read it.
+
+    Uses its own short message list (only system + current snapshot) so it
+    doesn't pollute the voice conversation history. Notable observations are
+    injected into conversation_history as assistant messages so the voice
+    assistant has context.
+    """
+    global _running
+
+    # Track last-seen values so we can detect changes
+    prev = {}
+
+    while _running:
+        time.sleep(interval)
+
+        sm = get_shared_memory_data()
+        if not sm or not sm.get('connected'):
+            continue
+
+        # Only monitor while a session is live (status == 2)
+        if sm.get('status', 0) != 2:
+            continue
+
+        telemetry_block = format_telemetry(sm)
+
+        # print(telemetry_block)
+
+        monitor_messages = [
+            {"role": "system",    "content": _MONITOR_SYSTEM},
+            {"role": "user",      "content": telemetry_block},
+        ]
+
+        try:
+            response = requests.post(OLLAMA_URL, json={
+                "model": OLLAMA_MODEL,
+                "messages": monitor_messages,
+                "stream": False,
+            })
+            if response.status_code != 200:
+                continue
+
+            data = response.json()
+            reply = data.get("message", {}).get("content", "").strip()
+
+            if reply and reply.upper() != "SILENT":
+                print(f"\n[Engineer] {reply}\n", flush=True)
+                # Inject into voice conversation so the driver's next question has context
+                conversation_history.append({
+                    "role": "assistant",
+                    "content": f"[Proactive observation] {reply}"
+                })
+
+        except Exception as exc:
+            print(f"[Monitor] Ollama request failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Audio transcription
+# ---------------------------------------------------------------------------
+
 def transcribe_live_microphone(
-    chunk_duration: float = 0.5,
+    chunk_duration:   float = 0.5,
     silence_duration: float = 1.2,
-    model_name: str = MODEL_NAME,
-    ollama_model: str = OLLAMA_MODEL,
-    system_prompt: str = None,
+    model_name:       str   = MODEL_NAME,
+    system_prompt:    str   = None,
 ) -> None:
     """
     Accumulates audio chunks while speech is detected.
@@ -266,16 +326,25 @@ def transcribe_live_microphone(
 
     signal.signal(signal.SIGINT, handle_sigint)
 
-    sample_rate = 16000
-    model = whisper.load_model(model_name)
+    sample_rate   = 16000
+    model         = whisper.load_model(model_name)
     print(f"Loaded Whisper model: {model_name}")
-    print(f"Connected to Ollama model: {ollama_model}")
+    print(f"Connected to Ollama model: {OLLAMA_MODEL}")
 
-    chunk_frames = int(sample_rate * chunk_duration)
-    audio_queue = queue.Queue()
+    chunk_frames  = int(sample_rate * chunk_duration)
+    audio_queue   = queue.Queue()
     conversation_history = []
     if system_prompt:
         conversation_history.append({"role": "system", "content": system_prompt})
+
+    # Start proactive telemetry monitor on a daemon thread
+    monitor_thread = threading.Thread(
+        target=_telemetry_monitor_loop,
+        args=(conversation_history,),
+        daemon=True,
+    )
+    monitor_thread.start()
+    print("[Monitor] Proactive telemetry monitor started (1 s interval).")
 
     def callback(indata, frames, time_info, status):
         if status:
@@ -285,31 +354,30 @@ def transcribe_live_microphone(
     print("Listening... Press Ctrl+C to stop.\n")
 
     utterance_index = 1
-    speech_buffer = []       # accumulates chunks during an utterance
-    silent_chunks = 0        # consecutive silent chunks after speech
+    speech_buffer   = []
+    silent_chunks   = 0
     max_silent_chunks = int(silence_duration / chunk_duration)
 
-    with sd.InputStream(samplerate=sample_rate, channels=1, dtype="int16", blocksize=chunk_frames, callback=callback):
+    with sd.InputStream(samplerate=sample_rate, channels=1, dtype="int16",
+                        blocksize=chunk_frames, callback=callback):
         while _running:
             try:
                 data = audio_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
-            audio = data.flatten()
+            audio          = data.flatten()
             speech_detected = is_speech(audio)
 
             if speech_detected:
                 speech_buffer.append(audio)
                 silent_chunks = 0
             elif speech_buffer:
-                # We're in silence after speech — count down
-                speech_buffer.append(audio)  # include trailing silence for natural endings
+                speech_buffer.append(audio)
                 silent_chunks += 1
 
                 if silent_chunks >= max_silent_chunks:
-                    # Silence threshold reached — transcribe the whole utterance
-                    full_audio = np.concatenate(speech_buffer)
+                    full_audio    = np.concatenate(speech_buffer)
                     speech_buffer = []
                     silent_chunks = 0
 
@@ -319,57 +387,50 @@ def transcribe_live_microphone(
                         continue
 
                     print(f"\nYou [{utterance_index}]: {text}")
-                    ask_ollama(text, conversation_history, ollama_model)
+                    ask_ollama(text, conversation_history)
                     utterance_index += 1
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    # Start game data server in background
-    server_thread = start_game_server()
-    if server_thread is None:
-        print("[Warning] Game server did not start (port may be in use). Continuing without telemetry.")
-    
-    parser = argparse.ArgumentParser(description="Whisper + Ollama voice assistant")
-    parser.add_argument("--chunk-duration", type=float, default=0.5, help="Audio polling interval in seconds")
-    parser.add_argument("--silence-duration", type=float, default=1.2, help="Seconds of silence before transcribing")
-    parser.add_argument("--whisper-model", default=MODEL_NAME, help="Whisper model (tiny, base, small, medium, large)")
-    parser.add_argument("--ollama-model", default=OLLAMA_MODEL, help="Ollama model name (e.g. llama3.1, mistral)")
+    start_game_server()
+
+    parser = argparse.ArgumentParser(description="Whisper + Ollama AC race engineer")
+    parser.add_argument("--chunk-duration",   type=float, default=0.5,
+                        help="Audio polling interval in seconds")
+    parser.add_argument("--silence-duration", type=float, default=1.2,
+                        help="Seconds of silence before transcribing")
+    parser.add_argument("--whisper-model",    default=MODEL_NAME,
+                        help="Whisper model (tiny, base, small, medium, large)")
     parser.add_argument(
         "--system-prompt",
         default=(
-            "You are an F1 race engineer providing expert technical advice about "
-            "vehicle performance, setup, and racing strategy. "
+            "You are an experienced F1 race engineer providing expert technical advice "
+            "about vehicle performance, setup, and racing strategy. "
             "You are communicating with a driver currently racing in Assetto Corsa. "
-            "You will receive telemetry data in the following format:\n\n"
-            "{\n"
-            "    'speed_kmh': speed_kmh,\n"
-            "    'engine_rpm': engine_rpm,\n"
-            "    'gear': gear,\n"
-            "    'gas': gas,\n"
-            "    'brake': brake,\n"
-            "    'lap_time': lap_time,\n"
-            "    'lap_count': lap_count,\n"
-            "    'is_in_pit': bool(in_pit),\n"
-            "    'is_abs_in_action': bool(abs_in_action),\n"
-            "    'is_tc_in_action': bool(tc_in_action),\n"
-            "    'is_engine_limiter_on': bool(engine_limiter)\n"
-            "}\n\n"
-            "Keep responses concise and realistic, similar to a real F1 race engineer "
-            "communicating over team radio. Focus only on relevant in-game telemetry "
-            "and driving information.Only use data from the telemetry data passed to you, don't hallucinate any data or try to roleplay. If you have no data, then say you have no data to make any responses. If the confidence in the driver's message is low "
-            "or unclear, ask them to repeat it."
+            "You will receive a live telemetry snapshot with every driver message.\n\n"
+            "Guidelines:\n"
+            "- Keep responses concise and realistic, like real F1 team radio.\n"
+            "- Only reference data that is actually present in the telemetry.\n"
+            "- If telemetry is missing or AC is not connected, say so.\n"
+            "- If the driver's message is unclear, ask them to repeat it.\n"
+            "- Do NOT hallucinate lap times, positions, or any other data."
         ),
-        help="System prompt to set the model's role and behavior."
+        help="System prompt for the voice assistant."
     )
     args = parser.parse_args()
 
-    transcribe_live_microphone(
-        chunk_duration=args.chunk_duration,
-        silence_duration=args.silence_duration,
-        model_name=args.whisper_model,
-        ollama_model=args.ollama_model,
-        system_prompt=args.system_prompt,
-    )
+    try:
+        transcribe_live_microphone(
+            chunk_duration=args.chunk_duration,
+            silence_duration=args.silence_duration,
+            model_name=args.whisper_model,
+            system_prompt=args.system_prompt,
+        )
+    finally:
+        stop_game_server()
 
 
 if __name__ == "__main__":
