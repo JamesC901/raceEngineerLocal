@@ -2,4 +2,7 @@ openai-whisper
 torch
 sounddevice
 numpy
-dotenv
+python-dotenv
+requests
+kokoro-onnx
+scipy
