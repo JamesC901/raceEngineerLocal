@@ -2,4 +2,4 @@ openai-whisper
 torch
 sounddevice
 numpy
-
+dotenv
