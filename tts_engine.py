@@ -22,14 +22,15 @@ import threading
 
 import numpy as np
 import sounddevice as sd
+from scipy.signal import butter, sosfilt
 
 # ---------------------------------------------------------------------------
 # Kokoro setup
 # ---------------------------------------------------------------------------
 
-VOICE = "bm_lewis"       # Change to taste — see docstring above
+VOICE = "bm_daniel"       # Change to taste — see docstring above
 SAMPLE_RATE = 24000      # Kokoro's native output sample rate
-SPEED = 1.15             # Slightly faster than normal — race engineer pacing
+SPEED = 0.95             # Slightly slower — gives prosody room to breathe
 
 _kokoro = None
 _kokoro_lock = threading.Lock()
@@ -45,6 +46,47 @@ def _get_kokoro():
                 _kokoro = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
                 print(f"[TTS] Kokoro loaded. Voice: {VOICE}, speed: {SPEED}")
     return _kokoro
+
+
+# ---------------------------------------------------------------------------
+# Audio post-processing — takes the edge off the synthetic sound
+# ---------------------------------------------------------------------------
+
+def _humanise(audio: np.ndarray) -> np.ndarray:
+    """
+    Apply a light chain of DSP to make Kokoro output sound less robotic:
+
+    1. Gentle lowpass (8 kHz)  — rolls off the brittle synthetic highs
+    2. Subtle pitch micro-variation — breaks up the perfectly flat pitch
+       that our ears instantly flag as synthetic
+    3. Normalise to 90% peak   — consistent loudness across sentences
+    """
+    audio = audio.astype(np.float32)
+
+    # 1. Lowpass at 8 kHz — removes harshness without dulling intelligibility
+    sos = butter(4, 8000, btype="low", fs=SAMPLE_RATE, output="sos")
+    audio = sosfilt(sos, audio).astype(np.float32)
+
+    # 2. Pitch micro-variation via very slow LFO on playback rate
+    #    We resample with a sinusoidal time-warp (~±0.4% over ~3 s cycle)
+    #    Subtle enough to be subliminal but breaks the robotic flatness.
+    n = len(audio)
+    t = np.linspace(0, n / SAMPLE_RATE, n, dtype=np.float32)
+    lfo = 1.0 + 0.004 * np.sin(2 * np.pi * 0.33 * t)   # 0.33 Hz, ±0.4%
+    warped_positions = np.clip(
+        np.cumsum(lfo) - 1, 0, n - 1
+    ).astype(np.float32)
+    indices_floor = warped_positions.astype(np.int32)
+    indices_ceil  = np.clip(indices_floor + 1, 0, n - 1)
+    frac          = warped_positions - indices_floor
+    audio = audio[indices_floor] * (1 - frac) + audio[indices_ceil] * frac
+
+    # 3. Normalise to 90% peak — consistent loudness across sentences
+    peak = np.max(np.abs(audio))
+    if peak > 0:
+        audio = audio * (0.90 / peak)
+
+    return audio.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +147,9 @@ def speak(text: str) -> None:
 
     kokoro = _get_kokoro()
     try:
-        samples, _ = kokoro.create(text, voice=VOICE, speed=SPEED, lang="en-gb")
+        samples, _ = kokoro.create(text, voice=VOICE, speed=SPEED, lang="en-us")
         # samples is a float32 numpy array at SAMPLE_RATE
+        samples = _humanise(samples)
         _audio_queue.put(samples)
     except Exception as exc:
         print(f"[TTS] Error generating speech: {exc}")

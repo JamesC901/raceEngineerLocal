@@ -104,11 +104,6 @@ def format_telemetry(sm: dict) -> str:
     session_label = session_map.get(sm.get('session_type', -1), "Unknown")
     lines.append(f"  Session      : {session_label}")
 
-    time_left = sm.get('session_time_left', 0)
-    if time_left > 0:
-        m, s = divmod(int(time_left), 60)
-        lines.append(f"  Time left    : {m}:{s:02d}")
-
     # --- Driving ---
     lines.append(f"  Speed        : {sm.get('speed_kmh', 0):.1f} km/h  |  "
                  f"RPM: {sm.get('engine_rpm', 0):.0f}  |  "
