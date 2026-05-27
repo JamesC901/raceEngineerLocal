@@ -239,11 +239,16 @@ _MONITOR_SYSTEM = (
     "car damage detected, flag changes (yellow/blue/black/checkered), pit-lane entry/exit, "
     "big lap-time delta vs best lap, or fuel running low.\n\n"
     "Rules:\n"
-    "- If nothing is noteworthy, respond with exactly: SILENT\n"
+    "- If nothing is noteworthy, dont make a response at all\n"
     "- Never comment on normal, expected driving data.\n"
-    "- Keep radio calls short, punchy, and realistic (1-2 sentences max).\n"
+    "- One short punchy sentence, like real F1 team radio. No preamble.\n"
     "- Do NOT repeat an observation you already made unless the situation has worsened.\n"
     "- Do NOT hallucinate or invent data not present in the telemetry."
+    "- Normal tyre temps (75-110°C is expected)\n"
+    "- Damage values of 0.0 means NO damage\n"
+    "- Fuel value is a percentage, not liters."
+    "- Do not speak for anything you have already mentioned unless it has significantly worsened"
+
 )
 
 
@@ -417,10 +422,13 @@ def main() -> None:
             "You are communicating with a driver currently racing in Assetto Corsa. "
             "You will receive a live telemetry snapshot with every driver message.\n\n"
             "Guidelines:\n"
-            "- Keep responses concise and realistic, like real F1 team radio.\n"
-            "- Only reference data that is actually present in the telemetry.\n"
+            "- Keep responses concise and realistic. One short punchy sentence, like real F1 team radio. No preamble.\n"
+            "- Only reference data that is actually present in the telemetry. Do NOT hallucinate or invent data not present in the telemetry.\n"
             "- If telemetry is missing or AC is not connected, say so.\n"
             "- If the driver's message is unclear, ask them to repeat it.\n"
+            "- Normal tyre temps (75-110°C is expected)\n"
+            "- Damage values of 0.0 means NO damage\n"
+            "- Fuel value is a percentage, not liters."
             "- Do NOT hallucinate lap times, positions, or any other data."
         ),
         help="System prompt for the voice assistant."
