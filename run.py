@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from game_server import start_game_server, stop_game_server
 from ac_shared_memory import get_shared_memory_data
 from gap_calculator import calculate_gaps
+from tts_engine import start_tts, stop_tts, speak, speak_streaming
 
 try:
     import sounddevice as sd
@@ -178,21 +179,21 @@ def format_telemetry(sm: dict) -> str:
 # Ollama interface
 # ---------------------------------------------------------------------------
 
-def _send_to_ollama(messages: list, stream: bool = True) -> str:
+def _stream_ollama_tokens(messages: list):
     """
-    Send a messages list to Ollama and return the full reply string.
-    Prints streamed tokens to stdout as they arrive.
+    Generator that posts to Ollama with stream=True and yields each text token.
+    Also prints tokens to stdout as they arrive.
     """
     response = requests.post(OLLAMA_URL, json={
         "model": OLLAMA_MODEL,
         "messages": messages,
-        "stream": stream,
-    }, stream=stream)
+        "stream": True,
+    }, stream=True)
 
     if response.status_code != 200:
-        return f"[Ollama error {response.status_code}]"
+        yield f"[Ollama error {response.status_code}]"
+        return
 
-    full_reply = ""
     for line in response.iter_lines():
         if not line:
             continue
@@ -200,10 +201,19 @@ def _send_to_ollama(messages: list, stream: bool = True) -> str:
         token = chunk.get("message", {}).get("content", "")
         if token:
             print(token, end="", flush=True)
-        full_reply += token
+            yield token
         if chunk.get("done"):
             break
 
+
+def _send_to_ollama(messages: list, stream: bool = True) -> str:
+    """
+    Send a messages list to Ollama and return the full reply string.
+    Streams tokens to stdout and through TTS sentence-by-sentence.
+    """
+    print("Ollama: ", end="", flush=True)
+    full_reply = speak_streaming(_stream_ollama_tokens(messages))
+    print()
     return full_reply
 
 
@@ -215,10 +225,8 @@ def ask_ollama(user_text: str, conversation_history: list) -> str:
 
     conversation_history.append({"role": "user", "content": full_message})
     print(f"\n[Sending to Ollama]\n{full_message}\n")
-    print("Ollama: ", end="", flush=True)
 
     reply = _send_to_ollama(conversation_history)
-    print()
 
     conversation_history.append({"role": "assistant", "content": reply})
     return reply
@@ -294,6 +302,7 @@ def _telemetry_monitor_loop(conversation_history: list, interval: float = 1.0):
 
             if reply and reply.upper() != "SILENT":
                 print(f"\n[Engineer] {reply}\n", flush=True)
+                speak(reply)
                 # Inject into voice conversation so the driver's next question has context
                 conversation_history.append({
                     "role": "assistant",
@@ -396,6 +405,7 @@ def transcribe_live_microphone(
 
 def main() -> None:
     start_game_server()
+    start_tts()
 
     parser = argparse.ArgumentParser(description="Whisper + Ollama AC race engineer")
     parser.add_argument("--chunk-duration",   type=float, default=0.5,
@@ -430,6 +440,7 @@ def main() -> None:
             system_prompt=args.system_prompt,
         )
     finally:
+        stop_tts()
         stop_game_server()
 
 
