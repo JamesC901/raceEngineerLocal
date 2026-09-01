@@ -227,46 +227,146 @@ def ask_ollama(user_text: str, conversation_history: list) -> str:
     return reply
 
 # ---------------------------------------------------------------------------
-# Proactive 1-second telemetry loop
+# Proactive 1-second telemetry loop — threshold checks in Python, not the LLM
 # ---------------------------------------------------------------------------
 
-# System prompt for the proactive monitor — separate from the voice conversation
-_MONITOR_SYSTEM = (
-    "You are an experienced F1 race engineer monitoring live telemetry for a driver "
-    "in Assetto Corsa. Every second you receive a full telemetry snapshot. "
-    "Your job is to call out anything that genuinely warrants driver attention — "
-    "examples: significant tyre wear difference across axles, dangerously high temps, "
-    "car damage detected, flag changes (yellow/blue/black/checkered), pit-lane entry/exit, "
-    "big lap-time delta vs best lap, or fuel running low.\n\n"
-    "Rules:\n"
-    "- If nothing is noteworthy, dont make a response at all\n"
-    "- Never comment on normal, expected driving data.\n"
-    "- One short punchy sentence, like real F1 team radio. No preamble.\n"
-    "- Do NOT repeat an observation you already made unless the situation has worsened.\n"
-    "- Do NOT hallucinate or invent data not present in the telemetry."
-    "- Normal tyre temps (75-110°C is expected)\n"
-    "- Damage values of 0.0 means NO damage\n"
-    "- Fuel value is a percentage, not liters."
-    "- Do not speak for anything you have already mentioned unless it has significantly worsened"
+# Thresholds — edit these to taste
+TYRE_TEMP_HIGH    = 110.0   # °C — report if any tyre exceeds this
+TYRE_TEMP_LOW     =  75.0   # °C — report if any tyre drops below this
+TYRE_WEAR_DELTA   =   0.05  # report if any corner differs from average by this much
+TYRE_DIRT_HIGH    =   0.5   # report if any tyre dirt exceeds this
+FUEL_LOW_PCT      =   5.0   # report if fuel % drops below this
+LAP_DELTA_S       =   3.0   # report if current lap is this many seconds off best
 
+# LLM only phrases the alert — it never decides whether to fire one
+_MONITOR_SYSTEM = (
+    "You are an F1 race engineer. You will be given a specific telemetry alert that has "
+    "already been confirmed as genuine by the engineering system. Your only job is to "
+    "rephrase it as a single short team-radio call — calm, assertive, no preamble. "
+    "Include the exact numeric values provided. Do not add any commentary, caveats, or "
+    "additional observations beyond what is given to you."
 )
 
 
+def _check_alerts(sm: dict, gaps: dict, prev: dict) -> list[str]:
+    """
+    Pure Python threshold checks. Returns a list of alert strings to speak,
+    or an empty list if everything is nominal. Never calls the LLM.
+    """
+    alerts = []
+
+    tyre_temp  = sm.get('tyre_core_temp', [0, 0, 0, 0])
+    tyre_wear  = sm.get('tyre_wear',      [0, 0, 0, 0])
+    tyre_dirty = sm.get('tyre_dirty',     [0, 0, 0, 0])
+    dmg        = sm.get('car_damage',     [0, 0, 0, 0, 0])
+    fuel       = sm.get('fuel', 0)
+    flag       = sm.get('flag', 'none').lower()
+    in_pit     = sm.get('is_in_pit_lane', False)
+    best_ms    = sm.get('best_lap_ms', 0)
+    current_ms = sm.get('current_lap_ms', 0)
+    labels     = ['FL', 'FR', 'RL', 'RR']
+
+    # --- Tyre temperatures ---
+    for i, (label, temp) in enumerate(zip(labels, tyre_temp)):
+        prev_temp = prev.get(f'tyre_temp_{i}', temp)
+        if temp > TYRE_TEMP_HIGH and prev_temp <= TYRE_TEMP_HIGH:
+            alerts.append(f"Tyre temp alert: {label} at {temp:.1f}°C, above {TYRE_TEMP_HIGH:.0f}°C limit.")
+        elif temp < TYRE_TEMP_LOW and prev_temp >= TYRE_TEMP_LOW:
+            alerts.append(f"Tyre temp alert: {label} at {temp:.1f}°C, below {TYRE_TEMP_LOW:.0f}°C minimum.")
+        prev[f'tyre_temp_{i}'] = temp
+
+    # --- Tyre wear imbalance ---
+    avg_wear = sum(tyre_wear) / 4
+    for label, wear in zip(labels, tyre_wear):
+        key = f'wear_alerted_{label}'
+        if abs(wear - avg_wear) > TYRE_WEAR_DELTA and not prev.get(key):
+            vals = ' / '.join(f'{w:.3f}' for w in tyre_wear)
+            alerts.append(f"Tyre wear imbalance: FL/FR/RL/RR = {vals}.")
+            prev[key] = True
+            break  # one alert covers all four corners
+        elif abs(wear - avg_wear) <= TYRE_WEAR_DELTA:
+            prev[f'wear_alerted_{label}'] = False
+
+    # --- Tyre dirt ---
+    for i, (label, dirt) in enumerate(zip(labels, tyre_dirty)):
+        key = f'dirt_alerted_{i}'
+        if dirt > TYRE_DIRT_HIGH and not prev.get(key):
+            alerts.append(f"Tyre dirt: {label} at {dirt:.2f}.")
+            prev[key] = True
+        elif dirt <= TYRE_DIRT_HIGH:
+            prev[key] = False
+
+    # --- Damage ---
+    dmg_labels = ['front', 'rear', 'left', 'right', 'centre']
+    for i, (part, val) in enumerate(zip(dmg_labels, dmg)):
+        key = f'dmg_alerted_{i}'
+        if val > 0.0 and not prev.get(key):
+            alerts.append(f"Damage detected: {part} at {val:.3f}.")
+            prev[key] = True
+
+    # --- Fuel ---
+    if fuel < FUEL_LOW_PCT and not prev.get('fuel_alerted'):
+        alerts.append(f"Fuel low: {fuel:.1f}%.")
+        prev['fuel_alerted'] = True
+    elif fuel >= FUEL_LOW_PCT:
+        prev['fuel_alerted'] = False
+
+    # --- Flags ---
+    reportable_flags = {'yellow', 'blue', 'black', 'checkered'}
+    if flag in reportable_flags and flag != prev.get('last_flag'):
+        alerts.append(f"{flag.upper()} flag.")
+        prev['last_flag'] = flag
+    elif flag not in reportable_flags:
+        prev['last_flag'] = None
+
+    # --- Pit lane ---
+    if in_pit and not prev.get('in_pit'):
+        alerts.append("Pit lane entry.")
+    elif not in_pit and prev.get('in_pit'):
+        alerts.append("Pit lane exit.")
+    prev['in_pit'] = in_pit
+
+    # --- Lap time delta ---
+    if best_ms > 0 and current_ms > 0:
+        delta_s = (current_ms - best_ms) / 1000
+        if delta_s > LAP_DELTA_S and not prev.get('lap_delta_alerted'):
+            alerts.append(f"Lap time {delta_s:.1f}s off best.")
+            prev['lap_delta_alerted'] = True
+        elif delta_s <= LAP_DELTA_S:
+            prev['lap_delta_alerted'] = False
+
+    # --- Gap to leader (only report meaningful increases) ---
+    gap_leader = gaps.get('gap_to_leader_s')
+    if gap_leader is not None:
+        prev_gap = prev.get('gap_to_leader')
+        if prev_gap is not None and (gap_leader - prev_gap) >= 1.0:
+            alerts.append(f"Gap to leader {gap_leader:.2f}s.")
+        prev['gap_to_leader'] = gap_leader
+
+    return alerts
+
+
+def _phrase_alert(raw_alert: str) -> str:
+    """Ask the LLM to rephrase a pre-validated alert as team radio."""
+    try:
+        response = requests.post(OLLAMA_URL, json={
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {"role": "system", "content": _MONITOR_SYSTEM},
+                {"role": "user",   "content": raw_alert},
+            ],
+            "stream": False,
+        })
+        if response.status_code == 200:
+            return response.json().get("message", {}).get("content", "").strip()
+    except Exception as exc:
+        print(f"[Monitor] Ollama request failed: {exc}")
+    return raw_alert  # fall back to the raw string if LLM fails
+
+
 def _telemetry_monitor_loop(conversation_history: list, interval: float = 1.0):
-    """
-    Background thread: every `interval` seconds, pull shared memory, format it,
-    and ask Ollama whether anything is worth reporting. If the reply is not
-    'SILENT', print it so the driver can hear/read it.
-
-    Uses its own short message list (only system + current snapshot) so it
-    doesn't pollute the voice conversation history. Notable observations are
-    injected into conversation_history as assistant messages so the voice
-    assistant has context.
-    """
     global _running
-
-    # Track last-seen values so we can detect changes
-    prev = {}
+    prev = {}  # holds last-seen values and alert-fired flags
 
     while _running:
         time.sleep(interval)
@@ -274,44 +374,21 @@ def _telemetry_monitor_loop(conversation_history: list, interval: float = 1.0):
         sm = get_shared_memory_data()
         if not sm or not sm.get('connected'):
             continue
-
-        # Only monitor while a session is live (status == 2)
         if sm.get('status', 0) != 2:
             continue
 
-        telemetry_block = format_telemetry(sm)
+        gaps = calculate_gaps()
+        alerts = _check_alerts(sm, gaps, prev)
 
-        # print(telemetry_block)
-
-        monitor_messages = [
-            {"role": "system",    "content": _MONITOR_SYSTEM},
-            {"role": "user",      "content": telemetry_block},
-        ]
-
-        try:
-            response = requests.post(OLLAMA_URL, json={
-                "model": OLLAMA_MODEL,
-                "messages": monitor_messages,
-                "stream": False,
-            })
-            if response.status_code != 200:
-                continue
-
-            data = response.json()
-            reply = data.get("message", {}).get("content", "").strip()
-
-            if reply and reply.upper() != "SILENT":
+        for raw_alert in alerts:
+            reply = _phrase_alert(raw_alert)
+            if reply:
                 print(f"\n[Engineer] {reply}\n", flush=True)
                 speak(reply)
-                # Inject into voice conversation so the driver's next question has context
                 conversation_history.append({
                     "role": "assistant",
                     "content": f"[Proactive observation] {reply}"
                 })
-
-        except Exception as exc:
-            print(f"[Monitor] Ollama request failed: {exc}")
-
 
 # ---------------------------------------------------------------------------
 # Audio transcription
@@ -416,23 +493,28 @@ def main() -> None:
                         help="Whisper model (tiny, base, small, medium, large)")
     parser.add_argument(
         "--system-prompt",
-        default=(
-            "You are an experienced F1 race engineer providing expert technical advice "
-            "about vehicle performance, setup, and racing strategy. "
-            "You are communicating with a driver currently racing in Assetto Corsa. "
-            "You will receive a live telemetry snapshot with every driver message.\n\n"
-            "Guidelines:\n"
-            "- Keep responses concise and realistic. One short punchy sentence, like real F1 team radio. No preamble.\n"
-            "- Only reference data that is actually present in the telemetry. Do NOT hallucinate or invent data not present in the telemetry.\n"
-            "- If telemetry is missing or AC is not connected, say so.\n"
-            "- If the driver's message is unclear, ask them to repeat it.\n"
-            "- Normal tyre temps (75-110°C is expected)\n"
-            "- Damage values of 0.0 means NO damage\n"
-            "- Fuel value is a percentage, not liters."
-            "- Do NOT hallucinate lap times, positions, or any other data."
-        ),
-        help="System prompt for the voice assistant."
-    )
+        default= (
+            "You are an experienced F1 race engineer monitoring live telemetry for a driver "
+            "in Assetto Corsa. Every second you receive a full telemetry snapshot. "
+            "Your job is to call out anything that genuinely warrants driver attention — "
+            "examples: significant tyre wear difference across axles, dangerously high temps, "
+            "car damage detected, flag changes (yellow/blue/black/checkered), pit-lane entry/exit, "
+            "big lap-time delta vs best lap, or fuel running low.\n\n"
+            "Rules:\n"
+            "- Use concise, calm, assertive statements.\n"
+            "- Avoid excitement, encouragement, or emotional language.\n"
+            "- If nothing is noteworthy, respond with only the single word SILENT and nothing else.\n"  # <-- tells it what to actually output
+            "- Never comment on normal, expected driving data.\n"
+            "- One short punchy sentence, like real F1 team radio. No preamble.\n"
+            "- Do NOT repeat an observation you already made unless the situation has worsened.\n"
+            "- Do NOT hallucinate or invent data not present in the telemetry.\n"          # <-- \n added
+            "- Tyre temperatures: SILENT unless at least one tyre is ABOVE 110°C or BELOW 40°C. "
+            "The range 40–110°C is completely normal. 71°C is normal. Do not report it.\n"
+            "- Never describe values as 'approaching limit' unless an explicit limit is provided in telemetry.\n"
+            "- Damage values of 0.0 means NO damage.\n"                                    # <-- \n added
+            "- Fuel value is a percentage. Respond SILENT for fuel unless it is below 5%.\n"  # <-- explicit SILENT instruction
+            "- Do not speak for anything you have already mentioned unless it has significantly worsened.\n"  # <-- \n added
+        ))
     args = parser.parse_args()
 
     try:
