@@ -35,10 +35,10 @@ from scipy.signal import butter, sosfilt
 # Kokoro setup
 # ---------------------------------------------------------------------------
 
-VOICE = "bm_daniel"   # Change to taste — see docstring above
+VOICE = "bm_lewis"   # Change to taste — see docstring above
 LANG_CODE = "b"       # 'b' = British English; matches bm_* voices
 SAMPLE_RATE = 24_000  # Kokoro's native output sample rate
-SPEED = 0.95          # Slightly slower — gives prosody room to breathe
+SPEED = 1.25         # Slightly slower — gives prosody room to breathe
 
 _pipeline = None
 _pipeline_lock = threading.Lock()
@@ -75,13 +75,13 @@ def _humanise(audio: np.ndarray) -> np.ndarray:
     audio = audio.astype(np.float32)
 
     # 1. Lowpass at 5.5 kHz — roll off brittle synthetic highs
-    sos_lp = butter(5, 5500, btype="low", fs=SAMPLE_RATE, output="sos")
+    sos_lp = butter(3, 8000, btype="low", fs=SAMPLE_RATE, output="sos")
     audio = sosfilt(sos_lp, audio).astype(np.float32)
 
     # 2. Low-mid warmth boost — gentle 2nd-order peak at 250 Hz, +3 dB, Q=0.7
     #    Adds the chest resonance that makes a voice sound grounded and human.
     #    Implemented as a biquad peaking EQ via bilinear transform.
-    f0, gain_db, Q = 250.0, 3.0, 0.7
+    f0, gain_db, Q = 180.0, 1.5, 0.9
     A  = 10 ** (gain_db / 40.0)
     w0 = 2 * np.pi * f0 / SAMPLE_RATE
     alpha = np.sin(w0) / (2 * Q)
@@ -96,21 +96,21 @@ def _humanise(audio: np.ndarray) -> np.ndarray:
 
     # 4. Pitch micro-variation — sinusoidal time-warp, ±1.2% over a ~4 s cycle
     #    Noticeably breaks up the robotic perfect-pitch flatness of TTS.
-    n = len(audio)
-    t = np.linspace(0, n / SAMPLE_RATE, n, dtype=np.float32)
-    lfo = 1.0 + 0.012 * np.sin(2 * np.pi * 0.25 * t)   # 0.25 Hz, ±1.2%
-    warped_positions = np.clip(
-        np.cumsum(lfo) - 1, 0, n - 1
-    ).astype(np.float32)
-    indices_floor = warped_positions.astype(np.int32)
-    indices_ceil  = np.clip(indices_floor + 1, 0, n - 1)
-    frac          = warped_positions - indices_floor
-    audio = audio[indices_floor] * (1 - frac) + audio[indices_ceil] * frac
+    # n = len(audio)
+    # t = np.linspace(0, n / SAMPLE_RATE, n, dtype=np.float32)
+    # lfo = 1.0 + 0.012 * np.sin(2 * np.pi * 0.25 * t)   # 0.25 Hz, ±1.2%
+    # warped_positions = np.clip(
+    #     np.cumsum(lfo) - 1, 0, n - 1
+    # ).astype(np.float32)
+    # indices_floor = warped_positions.astype(np.int32)
+    # indices_ceil  = np.clip(indices_floor + 1, 0, n - 1)
+    # frac          = warped_positions - indices_floor
+    # audio = audio[indices_floor] * (1 - frac) + audio[indices_ceil] * frac
 
     # 5. Soft-knee downward compression — ratio 3:1, threshold at 40% of peak
     #    Tames loud bursts and lifts quieter parts, mimicking natural speech dynamics.
-    threshold = 0.40
-    ratio     = 3.0
+    threshold = 0.55
+    ratio = 1.8
     knee      = 0.10          # soft-knee half-width around threshold
     abs_audio = np.abs(audio)
     # Smooth gain with a soft knee
